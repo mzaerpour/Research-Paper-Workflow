@@ -1,18 +1,17 @@
 name: Auto-update Stage Folder link
 
 on:
-  workflow_dispatch:        # run manually from Actions tab
+  workflow_dispatch:
   schedule:
-    - cron: "* * * * *"  # optional: every 30 minutes
+    - cron: "* * * * *"   # every minute (fastest allowed)
 
 jobs:
   sync:
     runs-on: ubuntu-latest
 
-    # 👇 EDIT THESE TWO to match your project URL
     env:
-      PROJECT_OWNER: "mzaerpour"   # your GitHub username or org
-      PROJECT_NUMBER: "3"          # from https://github.com/users/mzaerpour/projects/3
+      PROJECT_OWNER: "mzaerpour"  # your username or org
+      PROJECT_NUMBER: "3"         # from https://github.com/users/mzaerpour/projects/3
 
     steps:
       - name: Set up Python
@@ -25,7 +24,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Sync Stage → Stage Folder
+      - name: Sync Stage → Stage Folder (force & verbose)
         env:
           GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
           PROJECT_OWNER: ${{ env.PROJECT_OWNER }}
@@ -38,52 +37,49 @@ jobs:
           owner   = os.environ["PROJECT_OWNER"]
           number  = int(os.environ["PROJECT_NUMBER"])
 
-          headers = {
+          H = {
               "Authorization": f"Bearer {token}",
               "Content-Type": "application/json",
               "Accept": "application/vnd.github+json",
           }
-          endpoint = "https://api.github.com/graphql"
+          GQL = "https://api.github.com/graphql"
 
-          def gql(query, variables):
-              r = requests.post(endpoint, headers=headers, json={"query": query, "variables": variables})
+          def gql(q, v):
+              r = requests.post(GQL, headers=H, json={"query": q, "variables": v})
               r.raise_for_status()
-              data = r.json()
-              if "errors" in data:
-                  print("GraphQL errors:", data["errors"], file=sys.stderr)
+              j = r.json()
+              if "errors" in j:
+                  print("GraphQL errors:", j["errors"], file=sys.stderr)
                   sys.exit(1)
-              return data["data"]
+              return j["data"]
 
-          # ---------- helpers ----------
           def get_project(mode="user"):
-              base = '''
-              query($owner:String!, $number:Int!){
+              q = '''
+              query($owner:String!,$number:Int!){
                 REPLACEME(login:$owner){
                   projectV2(number:$number){
                     id
                     fields(first:50){
                       nodes{
-                        ... on ProjectV2SingleSelectField { id name options { id name } }
+                        ... on ProjectV2SingleSelectField { id name options{ id name } }
                         ... on ProjectV2FieldCommon       { id name }
                       }
                     }
                   }
                 }
-              }'''
-              q = base.replace("REPLACEME", mode)
-              data = gql(q, {"owner": owner, "number": number})
-              key = "user" if mode == "user" else "organization"
-              return data.get(key, {}).get("projectV2")
+              }'''.replace("REPLACEME", mode)
+              d = gql(q, {"owner": owner, "number": number})
+              return d["user" if mode=="user" else "organization"]["projectV2"]
 
-          def get_items_page(mode="user", after=None):
-              base = '''
-              query($owner:String!, $number:Int!, $after:String){
+          def get_items(mode="user", after=None):
+              q = '''
+              query($owner:String!,$number:Int!,$after:String){
                 REPLACEME(login:$owner){
                   projectV2(number:$number){
                     items(first:100, after:$after){
                       nodes{
                         id
-                        fieldValues(first:25){
+                        fieldValues(first:50){
                           nodes{
                             ... on ProjectV2ItemFieldSingleSelectValue{
                               field { ... on ProjectV2SingleSelectField { id name } }
@@ -100,24 +96,17 @@ jobs:
                     }
                   }
                 }
-              }'''
-              q = base.replace("REPLACEME", mode)
-              data = gql(q, {"owner": owner, "number": number, "after": after})
-              key = "user" if mode == "user" else "organization"
-              return data[key]["projectV2"]["items"]
+              }'''.replace("REPLACEME", mode)
+              d = gql(q, {"owner": owner, "number": number, "after": after})
+              return d["user" if mode=="user" else "organization"]["projectV2"]["items"]
 
-          # ---------- 1) get project & field IDs ----------
-          project = get_project("user")
-          mode = "user"
+          # 1) get project + fields
+          project = get_project("user") or get_project("organization")
           if not project:
-              project = get_project("organization")
-              mode = "organization"
-
-          if not project:
-              print("❌ Project not found. Check PROJECT_OWNER/PROJECT_NUMBER.", file=sys.stderr)
+              print("❌ Project not found. Check PROJECT_OWNER/PROJECT_NUMBER.")
               sys.exit(1)
 
-          project_id = project["id"]
+          proj_id = project["id"]
           fields = project["fields"]["nodes"]
 
           stage_field_id = None
@@ -129,37 +118,42 @@ jobs:
                   stage_folder_field_id = f["id"]
 
           if not stage_field_id or not stage_folder_field_id:
-              print("❌ Missing fields. Ensure 'Stage' (single select) and 'Stage Folder' (text) exist.", file=sys.stderr)
+              print("❌ Missing fields 'Stage' (single select) or 'Stage Folder' (text).")
               sys.exit(1)
 
-          # ---------- 2) fetch ALL items with pagination ----------
+          # 2) fetch all items
           all_items = []
           after = None
+          mode = "user"
+          # detect which mode worked
+          try:
+              # quick probe
+              get_items("user")
+          except:
+              mode = "organization"
           while True:
-              page = get_items_page(mode=mode, after=after)
-              all_items.extend(page["nodes"])
+              page = get_items(mode, after)
+              all_items += page["nodes"]
               if page["pageInfo"]["hasNextPage"]:
                   after = page["pageInfo"]["endCursor"]
               else:
                   break
 
-          # ---------- 3) map Stage → folder URL ----------
-          base_url = "https://github.com/mzaerpour/Research-Paper-Workflow/tree/main"
+          base = "https://github.com/mzaerpour/Research-Paper-Workflow/tree/main"
           mapping = {
-              "Conceptualization": f"{base_url}/docs/conceptualization",
-              "Lit Review":        f"{base_url}/docs/lit_review",
-              "Data":              f"{base_url}/data",
-              "Analysis":          f"{base_url}/code",
-              "Visualization":     f"{base_url}/figures",
-              "Writing":           f"{base_url}/drafts",
-              "Submission":        f"{base_url}/docs/submission",
-              "Under Review":      f"{base_url}/docs/under_review",
-              "Revision-1":        f"{base_url}/docs/revision_1",
-              "Revision-2":        f"{base_url}/docs/revision_2",
-              "Publication":       f"{base_url}/docs/publication",
+              "Conceptualization": f"{base}/docs/conceptualization",
+              "Lit Review":        f"{base}/docs/lit_review",
+              "Data":              f"{base}/data",
+              "Analysis":          f"{base}/code",
+              "Visualization":     f"{base}/figures",
+              "Writing":           f"{base}/drafts",
+              "Submission":        f"{base}/docs/submission",
+              "Under Review":      f"{base}/docs/under_review",
+              "Revision-1":        f"{base}/docs/revision_1",
+              "Revision-2":        f"{base}/docs/revision_2",
+              "Publication":       f"{base}/docs/publication",
           }
 
-          # ---------- 4) update text field ----------
           update_mut = '''
           mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $text:String!){
             updateProjectV2ItemFieldValue(input:{
@@ -171,12 +165,12 @@ jobs:
           }'''
 
           updated = 0
-          for item in all_items:
+          for idx, item in enumerate(all_items, 1):
               stage_val = None
               current_text = None
               for fv in item.get("fieldValues", {}).get("nodes", []):
                   fld = fv.get("field")
-                  if not fld:
+                  if not fld: 
                       continue
                   if fld.get("name") == "Stage" and "name" in fv:
                       stage_val = fv["name"]
@@ -184,14 +178,20 @@ jobs:
                       current_text = fv["text"]
 
               if not stage_val:
+                  print(f"- Item {idx}: no Stage set → skipping")
                   continue
 
               target = mapping.get(stage_val)
-              if not target or target == current_text:
-                  continue
+              if not target:
+                  fallback = f"{base}/docs"  # default if unknown Stage
+                  print(f"- Item {idx}: Stage='{stage_val}' not in mapping → setting fallback: {fallback}")
+                  target = fallback
+              else:
+                  print(f"- Item {idx}: Stage='{stage_val}' → Stage Folder='{target}'")
 
+              # Force update every time so changes are visible immediately
               gql(update_mut, {
-                  "projectId": project_id,
+                  "projectId": proj_id,
                   "itemId": item["id"],
                   "fieldId": stage_folder_field_id,
                   "text": target
