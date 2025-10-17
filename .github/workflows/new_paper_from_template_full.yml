@@ -31,7 +31,7 @@ on:
         description: "Template repo name"
         required: true
         type: string
-        default: "paper-project-template"
+        default: "research-project-template"
       # Your Project (the dashboard) owner & number:
       project_owner:
         description: "Owner of your GitHub Project (username or org)"
