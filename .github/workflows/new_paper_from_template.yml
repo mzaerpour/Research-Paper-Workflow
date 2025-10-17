@@ -1,10 +1,10 @@
-name: New Paper – Create repo, scaffold, add collaborators, link to Project
+name: New Paper – Create repo, scaffold, add collaborators, create/update Project row
 
 on:
   workflow_dispatch:
     inputs:
       item_title:
-        description: "Exact row title in your Project (e.g., 'Child exposure to heatwave in Canada')"
+        description: "Project row title (e.g., 'Child exposure to heatwave in Canada')"
         required: true
         type: string
       new_repo_name:
@@ -18,16 +18,16 @@ on:
         options: [private, public]
         default: private
       collaborators:
-        description: "Comma-separated GitHub usernames to add (e.g., user1,user2)"
+        description: "Comma-separated GitHub usernames to add (optional)"
         required: false
         type: string
       template_owner:
-        description: "Template repo owner (must exist & be marked as Template)"
+        description: "Template repo owner (must be marked as Template)"
         required: false
         type: string
         default: "mzaerpour"
       template_repo:
-        description: "Template repo name (leave blank to skip template)"
+        description: "Template repo name (leave as default or blank to skip)"
         required: false
         type: string
         default: "paper-project-template"
@@ -37,7 +37,7 @@ on:
         type: string
         default: "mzaerpour"
       project_number:
-        description: "Project number from the URL (e.g., 3)"
+        description: "Project number (from the project URL)"
         required: true
         type: string
         default: "3"
@@ -62,7 +62,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Create repo (template or scaffold), add collaborators, link Project row
+      - name: Create repo, scaffold if needed, add collaborators, create/update Project row
         env:
           GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
           ITEM_TITLE: ${{ github.event.inputs.item_title }}
@@ -75,7 +75,7 @@ jobs:
           COLLABS: ${{ github.event.inputs.collaborators }}
         run: |
           python - <<'PY'
-          import os, sys, base64, json, requests, time
+          import os, sys, base64, json, requests
 
           token   = os.environ["GH_TOKEN"]
           item_title = os.environ["ITEM_TITLE"].strip()
@@ -108,94 +108,118 @@ jobs:
               raise RuntimeError(j["errors"])
             return j["data"]
 
-          # ---- 1) Try template generate; else create empty repo ----
-          created_from_template = False
-          try:
-            if template_owner and template_repo:
+          # ---------- 0) who am I (to know if creating under user or org) ----------
+          me = rest("GET", f"{REST}/user")["login"]
+
+          # ---------- 1) Create (or reuse) repo ----------
+          created = False
+          exists = False
+          # try template
+          if template_owner and template_repo:
+            try:
               print(f"→ Attempting template generate: {template_owner}/{template_repo}")
               payload = {
-                "owner": project_owner,                # new repo owner (same as project owner)
+                "owner": project_owner,
                 "name": new_repo_name,
                 "private": (repo_visibility == "private"),
                 "include_all_branches": False,
               }
               rest("POST", f"{REST}/repos/{template_owner}/{template_repo}/generate", json=payload)
-              created_from_template = True
+              created = True
               print("✔ Created from template")
-            else:
-              print("ℹ️ No template specified; will scaffold from scratch")
-          except Exception as e:
-            print(f"⚠️ Template generate failed: {e}\n→ Will scaffold from scratch")
+            except Exception as e:
+              # if "name already exists", mark exists and continue
+              msg = str(e)
+              if "name already exists" in msg:
+                exists = True
+                print("ℹ️ Repo already exists; will reuse")
+              else:
+                print(f"⚠️ Template generate failed: {e} → will try plain create")
 
-          if not created_from_template:
-            # Create new empty repo under the project owner
-            repo_payload = {
-              "name": new_repo_name,
-              "private": (repo_visibility == "private"),
-              "auto_init": True,
-              "description": "Research paper repo scaffolded by workflow.",
-            }
-            # create under user/org
-            url = f"{REST}/user/repos" if project_owner == rest("GET", f"{REST}/user")["login"] else f"{REST}/orgs/{project_owner}/repos"
-            rest("POST", url, json=repo_payload)
-            print("✔ Empty repo created")
+          if not created and not exists:
+            # plain create (idempotent)
+            try:
+              payload = {
+                "name": new_repo_name,
+                "private": (repo_visibility == "private"),
+                "auto_init": True,
+                "description": "Research paper repo scaffolded by workflow.",
+              }
+              if project_owner == me:
+                rest("POST", f"{REST}/user/repos", json=payload)
+              else:
+                rest("POST", f"{REST}/orgs/{project_owner}/repos", json=payload)
+              created = True
+              print("✔ Empty repo created")
+            except Exception as e:
+              if "name already exists" in str(e):
+                exists = True
+                print("ℹ️ Repo already exists; will reuse")
+              else:
+                raise
 
-            # Scaffold standard folders/files via Contents API
-            def putfile(path, content):
-              b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
-              rest("PUT", f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}",
-                   json={"message": f"Add {path}", "content": b64, "branch":"main"})
-
-            # Minimal README
-            putfile("README.md", f"# {new_repo_name}\n\nThis repo follows the Research Paper Workflow structure.\n")
-
-            # Standard tree (each with README.md)
-            scaffold = {
-              "data/README.md": "Data access notes. Do not commit raw sensitive data.\n",
-              "code/README.md": "Analysis code entry points, environment, and scripts.\n",
-              "figures/README.md": "Auto-generated figures saved here by scripts.\n",
-              "drafts/README.md": "Manuscript drafts, outlines, and text.\n",
-              "docs/conceptualization/README.md": "Concept notes and hypotheses.\n",
-              "docs/lit_review/README.md": "Literature review notes and sources.\n",
-              "docs/submission/README.md": "Submission files: cover letter, checklist.\n",
-              "docs/under_review/README.md": "Correspondence and tracking while under review.\n",
-              "docs/revision_1/README.md": "Round 1 revisions: response letter and changes.\n",
-              "docs/revision_2/README.md": "Round 2 revisions: response letter and changes.\n",
-              "docs/publication/README.md": "Accepted version, proofs, and post-publication materials.\n",
-              "NEW_PAPER_CHECKLIST.md": (
-                "# New Paper Checklist\n\n"
-                "- [ ] Update README with full paper title\n"
-                "- [ ] Add collaborators (Settings → Collaborators)\n"
-                "- [ ] Fill PROJECT_OVERVIEW.md\n"
-                "- [ ] Create initial issues: Lit Review, Data Prep, Analysis, Writing\n"
-                "- [ ] Set milestones: Draft, Submission, R&R 1, Acceptance, Publication\n"
-                "- [ ] Link repo issues to the central Project\n"
-                "- [ ] Verify folders (data/code/figures/drafts/docs/*)\n"
-              ),
-            }
-            for path, content in scaffold.items():
-              putfile(path, content)
-            print("✔ Scaffolded standard folders and files")
-
-          # ---- 2) Resolve repo info ----
+          # ---------- 2) Get repo id + url ----------
           q_repo = """
           query($owner:String!,$name:String!){
-            repository(owner:$owner, name:$name){ id url nameWithOwner }
+            repository(owner:$owner, name:$name){ id url nameWithOwner defaultBranchRef { name } }
           }"""
           repo_data = gql(q_repo, {"owner": project_owner, "name": new_repo_name})["repository"]
           repo_id = repo_data["id"]
           repo_url = repo_data["url"]
           owner_repo = repo_data["nameWithOwner"]
-          print(f"✔ Repo ready: {owner_repo} ({repo_url})")
+          default_branch = (repo_data["defaultBranchRef"]["name"] if repo_data["defaultBranchRef"] else "main") or "main"
+          print(f"✔ Repo ready: {owner_repo} ({repo_url}) default_branch={default_branch}")
 
-          # ---- 3) Add collaborators ----
+          # ---------- 3) Scaffold tree if folders missing ----------
+          def file_exists(path):
+            r = requests.get(f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}?ref={default_branch}", headers=H)
+            return r.status_code == 200
+
+          def putfile(path, content):
+            if file_exists(path):
+              return
+            b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+            rest("PUT", f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}",
+                 json={"message": f"Add {path}", "content": b64, "branch": default_branch})
+
+          # always ensure minimal README + standard folders
+          putfile("README.md", f"# {new_repo_name}\n\nThis repo follows the Research Paper Workflow structure.\n")
+          scaffold = {
+            "data/README.md": "Data access notes. Do not commit raw sensitive data.\n",
+            "code/README.md": "Analysis code entry points, environment, and scripts.\n",
+            "figures/README.md": "Auto-generated figures saved here by scripts.\n",
+            "drafts/README.md": "Manuscript drafts, outlines, and text.\n",
+            "docs/conceptualization/README.md": "Concept notes and hypotheses.\n",
+            "docs/lit_review/README.md": "Literature review notes and sources.\n",
+            "docs/submission/README.md": "Submission files: cover letter, checklist.\n",
+            "docs/under_review/README.md": "Correspondence and tracking while under review.\n",
+            "docs/revision_1/README.md": "Round 1 revisions: response letter and changes.\n",
+            "docs/revision_2/README.md": "Round 2 revisions: response letter and changes.\n",
+            "docs/publication/README.md": "Accepted version, proofs, and post-publication materials.\n",
+            "NEW_PAPER_CHECKLIST.md": (
+              "# New Paper Checklist\n\n"
+              "- [ ] Update README with full paper title\n"
+              "- [ ] Add collaborators (Settings → Collaborators)\n"
+              "- [ ] Fill PROJECT_OVERVIEW.md\n"
+              "- [ ] Create initial issues (Lit Review, Data Prep, Analysis, Writing)\n"
+              "- [ ] Set milestones (Draft, Submission, R&R, Acceptance, Publication)\n"
+              "- [ ] Link repo issues to the central Project\n"
+            ),
+          }
+          for path, content in scaffold.items():
+            putfile(path, content)
+          print("✔ Scaffold verified")
+
+          # ---------- 4) Add collaborators (push permission) ----------
           for u in collabs:
             print(f"→ Adding collaborator: {u}")
-            # permission can be: pull, triage, push, maintain, admin
-            rest("PUT", f"{REST}/repos/{project_owner}/{new_repo_name}/collaborators/{u}",
-                 json={"permission":"push"})
+            try:
+              rest("PUT", f"{REST}/repos/{project_owner}/{new_repo_name}/collaborators/{u}",
+                   json={"permission":"push"})
+            except Exception as e:
+              print(f"⚠️ Could not add collaborator {u}: {e}")
 
-          # ---- 4) Link Project row Repository field ----
+          # ---------- 5) Load Project + fields ----------
           q_proj = """
           query($owner:String!, $number:Int!){
             user(login:$owner){
@@ -203,19 +227,15 @@ jobs:
                 id
                 fields(first:50){
                   nodes{
-                    ... on ProjectV2RepositoryField { id name }
-                    ... on ProjectV2FieldCommon     { id name }
+                    ... on ProjectV2RepositoryField     { id name }
+                    ... on ProjectV2FieldCommon         { id name }
+                    ... on ProjectV2SingleSelectField   { id name options{ id name } }
                   }
                 }
                 items(first:100){
                   nodes{
                     id
-                    content{
-                      __typename
-                      ... on DraftIssue { title }
-                      ... on Issue      { title }
-                      ... on PullRequest{ title }
-                    }
+                    content{ __typename ... on DraftIssue { title } ... on Issue{ title } ... on PullRequest{ title } }
                   }
                 }
               }
@@ -226,35 +246,129 @@ jobs:
           proj_id = proj["id"]
           fields = proj["fields"]["nodes"]
 
-          repo_field_id = None
+          # field IDs
+          repo_field_id = stage_field_id = status_field_id = priority_field_id = stage_folder_field_id = None
           for f in fields:
             if f["name"] == "Repository":
               repo_field_id = f["id"]
-              break
+            elif f["name"] == "Stage":
+              stage_field_id = f["id"]
+              stage_options = f.get("options") or []
+            elif f["name"] == "Status":
+              status_field_id = f["id"]
+              status_options = f.get("options") or []
+            elif f["name"] == "Priority":
+              priority_field_id = f["id"]
+              priority_options = f.get("options") or []
+            elif f["name"] == "Stage Folder":
+              stage_folder_field_id = f["id"]
+
           if not repo_field_id:
             raise RuntimeError("Project is missing a 'Repository' field (type: Repository). Create it first.")
+          if not stage_field_id or not stage_folder_field_id:
+            raise RuntimeError("Project must have 'Stage' (single select) and 'Stage Folder' (text) fields.")
 
+          # pick FIRST options as defaults where applicable
+          def first_option_id(opts): return (opts[0]["id"] if opts else None)
+          stage_default_id   = first_option_id(stage_options)     # e.g., Conceptualization
+          status_default_id  = first_option_id(status_options)    # first of your Status options
+          priority_default_id= first_option_id(priority_options)
+
+          # ---------- 6) Find or create the item (row) ----------
           item_id = None
           for it in proj["items"]["nodes"]:
             c = it.get("content") or {}
             if c.get("title") == item_title:
-              item_id = it["id"]
-              break
-          if not item_id:
-            raise RuntimeError(f"Could not find a project item with title: {item_title!r}")
+              item_id = it["id"]; break
 
-          mut = """
+          if not item_id:
+            # create a Draft Issue directly in the project
+            mut_create = """
+            mutation($projectId:ID!, $title:String!){
+              addProjectV2DraftIssue(input:{projectId:$projectId, title:$title}) {
+                projectItem { id }
+              }
+            }"""
+            item_id = gql(mut_create, {"projectId": proj_id, "title": item_title})["addProjectV2DraftIssue"]["projectItem"]["id"]
+            print(f"✔ Created project row: {item_title}")
+
+          # ---------- 7) Set Repository field ----------
+          mut_repo = """
           mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $repoId:ID!){
             updateProjectV2ItemFieldValue(input:{
-              projectId:$projectId,
-              itemId:$itemId,
-              fieldId:$fieldId,
-              value:{ repositoryId:$repoId }
-            }){
-              projectV2Item{ id }
+              projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:{ repositoryId:$repoId }
+            }){ projectV2Item{ id } }
+          }"""
+          gql(mut_repo, {"projectId": proj_id, "itemId": item_id, "fieldId": repo_field_id, "repoId": repo_id})
+          print("✔ Linked Repository field")
+
+          # ---------- 8) Set defaults for Stage / Status / Priority ----------
+          mut_single = """
+          mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!){
+            updateProjectV2ItemFieldValue(input:{
+              projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:{ singleSelectOptionId:$optionId }
+            }){ projectV2Item{ id } }
+          }"""
+          if stage_default_id:
+            gql(mut_single, {"projectId": proj_id, "itemId": item_id, "fieldId": stage_field_id, "optionId": stage_default_id})
+            print("✔ Stage set to first option")
+          if status_default_id:
+            gql(mut_single, {"projectId": proj_id, "itemId": item_id, "fieldId": status_field_id, "optionId": status_default_id})
+            print("✔ Status set to first option")
+          if priority_default_id:
+            gql(mut_single, {"projectId": proj_id, "itemId": item_id, "fieldId": priority_field_id, "optionId": priority_default_id})
+            print("✔ Priority set to first option")
+
+          # ---------- 9) Compute Stage Folder link now (no waiting) ----------
+          # We need the current Stage name to choose the folder path
+          q_fieldvals = """
+          query($projectId:ID!, $itemId:ID!){
+            node(id:$itemId){
+              ... on ProjectV2Item{
+                fieldValues(first:50){
+                  nodes{
+                    ... on ProjectV2ItemFieldSingleSelectValue{
+                      field { ... on ProjectV2SingleSelectField { name } }
+                      name
+                    }
+                  }
+                }
+              }
             }
           }"""
-          gql(mut, {"projectId": proj_id, "itemId": item_id, "fieldId": repo_field_id, "repoId": repo_id})
-          print(f"✔ Linked project row '{item_title}' to repository {owner_repo}")
-          print("✅ Done.")
+          vals = gql(q_fieldvals, {"projectId": proj_id, "itemId": item_id})["node"]["fieldValues"]["nodes"]
+          stage_name = None
+          for v in vals:
+            fld = v.get("field") or {}
+            if fld.get("name") == "Stage":
+              stage_name = v.get("name"); break
+
+          base = repo_url.rstrip("/") + f"/tree/{default_branch}"
+          paths = {
+            "Conceptualization": "/docs/conceptualization",
+            "Lit Review":        "/docs/lit_review",
+            "Data":              "/data",
+            "Analysis":          "/code",
+            "Visualization":     "/figures",
+            "Writing":           "/drafts",
+            "Submission":        "/docs/submission",
+            "Under Review":      "/docs/under_review",
+            "Revision-1":        "/docs/revision_1",
+            "Revision-2":        "/docs/revision_2",
+            "Publication":       "/docs/publication",
+          }
+          link = base + paths.get(stage_name or "", "")
+          if link and paths.get(stage_name or ""):
+            mut_text = """
+            mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $text:String!){
+              updateProjectV2ItemFieldValue(input:{
+                projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:{ text:$text }
+              }){ projectV2Item{ id } }
+            }"""
+            gql(mut_text, {"projectId": proj_id, "itemId": item_id, "fieldId": stage_folder_field_id, "text": link})
+            print(f"✔ Stage Folder set to {link}")
+          else:
+            print(f"ℹ️ Stage '{stage_name}' has no mapped folder; Stage Folder left blank")
+
+          print("✅ All done.")
           PY
