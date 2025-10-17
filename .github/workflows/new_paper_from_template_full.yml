@@ -165,35 +165,62 @@ jobs:
           default_branch = (repo_data["defaultBranchRef"]["name"] if repo_data["defaultBranchRef"] else "main") or "main"
           print(f"✔ Repo ready: {owner_repo} ({repo_url}) default_branch={default_branch}")
 
-          # 3) Scaffold folders/files if missing
+          # 3) Scaffold standard folders/files if needed
+          # Only scaffold when we did NOT create from a template.
+          # (If a template was used, the structure is already there.)
+          def get_with_retry(path, tries=5):
+              import time
+              url = f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}?ref={default_branch}"
+              for i in range(tries):
+                  r = requests.get(url, headers=H)
+                  if r.status_code in (200, 404):
+                      return r
+                  time.sleep(0.6)
+              return r  # last response
+          
           def file_exists(path):
-            r = requests.get(f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}?ref={default_branch}", headers=H)
-            return r.status_code == 200
-
+              r = get_with_retry(path)
+              return r.status_code == 200
+          
           def putfile(path, content):
-            if file_exists(path):
-              return
-            b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
-            rest("PUT", f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}",
-                 json={"message": f"Add {path}", "content": b64, "branch": default_branch})
+              # Create if missing; if it exists (409) just skip
+              import base64
+              if file_exists(path):
+                  return
+              b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+              url = f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}"
+              try:
+                  rest("PUT", url, json={"message": f"Add {path}", "content": b64, "branch": default_branch})
+              except requests.HTTPError as e:
+                  # Race: GitHub reported 404 then populated file; treat as OK.
+                  if e.response is not None and e.response.status_code == 409:
+                      print(f"ℹ️ {path} already exists, skipping.")
+                  else:
+                      raise
+          
+          # Only scaffold when NOT created from template
+          if not created:
+              # This branch runs if we did a plain empty repo create.
+              putfile("README.md", f"# {new_repo_name}\n\nThis repo follows the Research Paper Workflow structure.\n")
+              scaffold = {
+                  "data/README.md": "Data access notes. Do not commit raw sensitive data.\n",
+                  "code/README.md": "Analysis code entry points, environment, and scripts.\n",
+                  "figures/README.md": "Auto-generated figures saved here by scripts.\n",
+                  "drafts/README.md": "Manuscript drafts, outlines, and text.\n",
+                  "docs/conceptualization/README.md": "Concept notes and hypotheses.\n",
+                  "docs/lit_review/README.md": "Literature review notes and sources.\n",
+                  "docs/submission/README.md": "Submission files: cover letter, checklist.\n",
+                  "docs/under_review/README.md": "Correspondence and tracking while under review.\n",
+                  "docs/revision_1/README.md": "Round 1 revisions: response letter and changes.\n",
+                  "docs/revision_2/README.md": "Round 2 revisions: response letter and changes.\n",
+                  "docs/publication/README.md": "Accepted version, proofs, and post-publication materials.\n",
+              }
+              for path, content in scaffold.items():
+                  putfile(path, content)
+              print("✔ Scaffold verified (empty-repo path)")
+          else:
+              print("✔ Skipped scaffolding (template already provided files)")
 
-          putfile("README.md", f"# {new_repo_name}\n\nThis repo follows the Research Paper Workflow structure.\n")
-          scaffold = {
-            "data/README.md": "Data access notes. Do not commit raw sensitive data.\n",
-            "code/README.md": "Analysis code entry points, environment, and scripts.\n",
-            "figures/README.md": "Auto-generated figures saved here by scripts.\n",
-            "drafts/README.md": "Manuscript drafts, outlines, and text.\n",
-            "docs/conceptualization/README.md": "Concept notes and hypotheses.\n",
-            "docs/lit_review/README.md": "Literature review notes and sources.\n",
-            "docs/submission/README.md": "Submission files: cover letter, checklist.\n",
-            "docs/under_review/README.md": "Correspondence and tracking while under review.\n",
-            "docs/revision_1/README.md": "Round 1 revisions: response letter and changes.\n",
-            "docs/revision_2/README.md": "Round 2 revisions: response letter and changes.\n",
-            "docs/publication/README.md": "Accepted version, proofs, and post-publication materials.\n",
-          }
-          for path, content in scaffold.items():
-            putfile(path, content)
-          print("✔ Scaffold verified")
 
           # 4) Add collaborators
           for u in collabs:
