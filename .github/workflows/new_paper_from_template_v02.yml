@@ -1,0 +1,381 @@
+name: New Paper – Create repo, scaffold, add collaborators, create/update Project row (via Issue)
+
+on:
+  workflow_dispatch:
+    inputs:
+      item_title:
+        description: "Project row / Issue title (e.g., 'Child exposure to heatwave in Canada')"
+        required: true
+        type: string
+      new_repo_name:
+        description: "New repository name (e.g., paper-heatwave-children-2025)"
+        required: true
+        type: string
+      repo_visibility:
+        description: "Visibility of the new repo"
+        required: true
+        type: choice
+        options: [private, public]
+        default: private
+      collaborators:
+        description: "Comma-separated GitHub usernames to add (optional)"
+        required: false
+        type: string
+      template_owner:
+        description: "Template repo owner (must be marked as Template)"
+        required: true
+        type: string
+        default: "mzaerpour"
+      template_repo:
+        description: "Template repo name"
+        required: true
+        type: string
+        default: "paper-project-template"
+      project_owner:
+        description: "Owner of your GitHub Project (username or org)"
+        required: true
+        type: string
+        default: "mzaerpour"
+      project_number:
+        description: "Project number (from the project URL, e.g., /projects/3 → 3)"
+        required: true
+        type: string
+        default: "3"
+
+jobs:
+  new-paper:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      actions: read
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Create repo, add collaborators, create Issue, add to Project, set fields
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+          ITEM_TITLE: ${{ github.event.inputs.item_title }}
+          NEW_REPO_NAME: ${{ github.event.inputs.new_repo_name }}
+          REPO_VISIBILITY: ${{ github.event.inputs.repo_visibility }}
+          TEMPLATE_OWNER: ${{ github.event.inputs.template_owner }}
+          TEMPLATE_REPO: ${{ github.event.inputs.template_repo }}
+          PROJECT_OWNER: ${{ github.event.inputs.project_owner }}
+          PROJECT_NUMBER: ${{ github.event.inputs.project_number }}
+          COLLABS: ${{ github.event.inputs.collaborators }}
+        run: |
+          python - <<'PY'
+          import os, sys, base64, time, requests
+
+          token   = os.environ["GH_TOKEN"]
+          item_title = os.environ["ITEM_TITLE"].strip()
+          new_repo_name = os.environ["NEW_REPO_NAME"].strip()
+          repo_visibility = os.environ["REPO_VISIBILITY"].strip().lower()
+          template_owner = os.environ["TEMPLATE_OWNER"].strip()
+          template_repo  = os.environ["TEMPLATE_REPO"].strip()
+          project_owner  = os.environ["PROJECT_OWNER"].strip()
+          project_number = int(os.environ["PROJECT_NUMBER"])
+          collabs = [u.strip() for u in (os.environ.get("COLLABS","").split(",") if os.environ.get("COLLABS") else []) if u.strip()]
+
+          REST = "https://api.github.com"
+          GQL  = f"{REST}/graphql"
+          H = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+          }
+
+          def rest(method, url, **kw):
+            r = requests.request(method, url, headers=H, **kw)
+            if r.status_code >= 400:
+              raise requests.HTTPError(f"{method} {url} -> {r.status_code} {r.text}", response=r)
+            return r.json() if r.text else {}
+
+          def gql(q, v):
+            r = requests.post(GQL, headers=H, json={"query": q, "variables": v})
+            j = r.json()
+            if "errors" in j:
+              raise RuntimeError(j["errors"])
+            return j["data"]
+
+          # who am I
+          me = rest("GET", f"{REST}/user")["login"]
+
+          # 1) Create/reuse repo from template, else plain create
+          created_from_template = False
+          exists = False
+          try:
+            print(f"→ Template generate: {template_owner}/{template_repo} → {project_owner}/{new_repo_name}")
+            payload = {
+              "owner": project_owner,
+              "name": new_repo_name,
+              "private": (repo_visibility == "private"),
+              "include_all_branches": False,
+            }
+            rest("POST", f"{REST}/repos/{template_owner}/{template_repo}/generate", json=payload)
+            created_from_template = True
+            print("✔ Created from template")
+          except Exception as e:
+            if "name already exists" in str(e):
+              exists = True
+              print("ℹ️ Repo already exists; will reuse")
+            else:
+              print(f"⚠️ Template generate failed: {e} → try plain create")
+              try:
+                payload = {
+                  "name": new_repo_name,
+                  "private": (repo_visibility == "private"),
+                  "auto_init": True,
+                  "description": "Research paper repo scaffolded by workflow.",
+                }
+                if project_owner == me:
+                  rest("POST", f"{REST}/user/repos", json=payload)
+                else:
+                  rest("POST", f"{REST}/orgs/{project_owner}/repos", json=payload)
+                print("✔ Empty repo created")
+              except Exception as e2:
+                if "name already exists" in str(e2):
+                  exists = True
+                  print("ℹ️ Repo already exists; will reuse")
+                else:
+                  raise
+
+          # 2) Repo info
+          q_repo = """
+          query($owner:String!,$name:String!){
+            repository(owner:$owner, name:$name){
+              id url nameWithOwner defaultBranchRef { name }
+            }
+          }"""
+          repo_data = gql(q_repo, {"owner": project_owner, "name": new_repo_name})["repository"]
+          repo_id = repo_data["id"]
+          repo_url = repo_data["url"]
+          owner_repo = repo_data["nameWithOwner"]
+          default_branch = (repo_data["defaultBranchRef"]["name"] if repo_data["defaultBranchRef"] else "main") or "main"
+          print(f"✔ Repo ready: {owner_repo} ({repo_url}) default_branch={default_branch}")
+
+          # 3) Skip scaffolding if template already provided files
+          if created_from_template:
+            print("✔ Skipped scaffolding (template already provided files)")
+          else:
+            def get_with_retry(path, tries=5):
+              url = f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}?ref={default_branch}"
+              for i in range(tries):
+                r = requests.get(url, headers=H)
+                if r.status_code in (200, 404): return r
+                time.sleep(0.6)
+              return r
+
+            def file_exists(path):
+              return get_with_retry(path).status_code == 200
+
+            def putfile(path, content):
+              if file_exists(path): return
+              b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+              url = f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}"
+              try:
+                rest("PUT", url, json={"message": f"Add {path}", "content": b64, "branch": default_branch})
+              except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code == 409:
+                  print(f"ℹ️ {path} already exists, skipping.")
+                else:
+                  raise
+
+            putfile("README.md", f"# {new_repo_name}\n\nThis repo follows the Research Paper Workflow structure.\n")
+            scaffold = {
+              "data/README.md": "Data access notes. Do not commit raw sensitive data.\n",
+              "code/README.md": "Analysis code entry points, environment, and scripts.\n",
+              "figures/README.md": "Auto-generated figures saved here by scripts.\n",
+              "drafts/README.md": "Manuscript drafts, outlines, and text.\n",
+              "docs/conceptualization/README.md": "Concept notes and hypotheses.\n",
+              "docs/lit_review/README.md": "Literature review notes and sources.\n",
+              "docs/submission/README.md": "Submission files: cover letter, checklist.\n",
+              "docs/under_review/README.md": "Correspondence and tracking while under review.\n",
+              "docs/revision_1/README.md": "Round 1 revisions: response letter and changes.\n",
+              "docs/revision_2/README.md": "Round 2 revisions: response letter and changes.\n",
+              "docs/publication/README.md": "Accepted version, proofs, and post-publication materials.\n",
+            }
+            for path, content in scaffold.items():
+              putfile(path, content)
+            print("✔ Scaffold verified (empty-repo path)")
+
+          # 4) Add collaborators
+          for u in collabs:
+            print(f"→ Adding collaborator: {u}")
+            try:
+              rest("PUT", f"{REST}/repos/{project_owner}/{new_repo_name}/collaborators/{u}",
+                   json={"permission":"push"})
+            except Exception as e:
+              print(f"⚠️ Could not add collaborator {u}: {e}")
+
+          # 5) Create an Issue in the new repo (this makes the Project's built-in Repository column populate)
+          issue = rest("POST", f"{REST}/repos/{project_owner}/{new_repo_name}/issues",
+                       json={"title": item_title, "body": "Autocreated by workflow."})
+          issue_number = issue["number"]
+          print(f"✔ Created issue #{issue_number}")
+
+          # GraphQL id of that issue
+          q_issue = """
+          query($owner:String!,$name:String!,$num:Int!){
+            repository(owner:$owner, name:$name){ issue(number:$num){ id title } }
+          }"""
+          issue_node = gql(q_issue, {"owner": project_owner, "name": new_repo_name, "num": issue_number})["repository"]["issue"]
+          issue_id = issue_node["id"]
+
+          # 6) Load Project and fields (we'll add the Issue as the row)
+          q_proj = """
+          query($owner:String!, $number:Int!){
+            user(login:$owner){
+              projectV2(number:$number){
+                id
+                fields(first:50){
+                  nodes{
+                    ... on ProjectV2FieldCommon       { id name }
+                    ... on ProjectV2SingleSelectField { id name options{ id name } }
+                  }
+                }
+                items(first:100){
+                  nodes{
+                    id
+                    content{ __typename
+                      ... on DraftIssue { title }
+                      ... on Issue      { title id }
+                      ... on PullRequest{ title }
+                    }
+                  }
+                }
+              }
+            }
+          }"""
+          d = gql(q_proj, {"owner": project_owner, "number": project_number})
+          proj = d["user"]["projectV2"]
+          proj_id = proj["id"]
+          fields = proj["fields"]["nodes"]
+
+          # find field IDs by name
+          stage_field_id = status_field_id = priority_field_id = stage_folder_field_id = None
+          stage_options = status_options = priority_options = []
+          for f in fields:
+            if f["name"] == "Stage": stage_field_id, stage_options = f["id"], (f.get("options") or [])
+            elif f["name"] == "Status": status_field_id, status_options = f["id"], (f.get("options") or [])
+            elif f["name"] == "Priority": priority_field_id, priority_options = f["id"], (f.get("options") or [])
+            elif f["name"] == "Stage Folder": stage_folder_field_id = f["id"]
+
+          if not stage_field_id or not stage_folder_field_id:
+            raise RuntimeError("Project must have 'Stage' (single select) and 'Stage Folder' (text).")
+
+          def first_id(opts): return (opts[0]["id"] if opts else None)
+          stage_default_id   = first_id(stage_options)
+          status_default_id  = first_id(status_options)
+          priority_default_id= first_id(priority_options)
+
+          # 7) If a Draft row with same title exists, delete it; then add Issue to project
+          existing_draft_id = None
+          existing_issue_item_id = None
+          for it in proj["items"]["nodes"]:
+            c = it.get("content") or {}
+            if c.get("__typename") == "DraftIssue" and c.get("title") == item_title:
+              existing_draft_id = it["id"]
+            if c.get("__typename") == "Issue" and c.get("title") == item_title:
+              existing_issue_item_id = it["id"]
+
+          # Add Issue if not already present
+          if not existing_issue_item_id:
+            mut_add = """
+            mutation($projectId:ID!, $contentId:ID!){
+              addProjectV2ItemById(input:{projectId:$projectId, contentId:$contentId}){
+                item{ id }
+              }
+            }"""
+            existing_issue_item_id = gql(mut_add, {"projectId": proj_id, "contentId": issue_id})["addProjectV2ItemById"]["item"]["id"]
+            print("✔ Issue added to Project")
+          else:
+            print("ℹ️ Issue already in Project")
+
+          # Delete draft row (optional cleanup)
+          if existing_draft_id:
+            mut_del = "mutation($id:ID!){ deleteProjectV2Item(input:{itemId:$id}){ deletedItemId }}"
+            gql(mut_del, {"id": existing_draft_id})
+            print("✔ Removed old Draft row")
+
+          item_id = existing_issue_item_id
+
+          # 8) Set Stage/Status/Priority defaults (first options)
+          mut_single = """
+          mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!){
+            updateProjectV2ItemFieldValue(input:{
+              projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:{ singleSelectOptionId:$optionId }
+            }){ projectV2Item{ id } }
+          }"""
+          if stage_default_id:
+            gql(mut_single, {"projectId": proj_id, "itemId": item_id, "fieldId": stage_field_id, "optionId": stage_default_id})
+            print("✔ Stage set to first option")
+          if status_default_id:
+            gql(mut_single, {"projectId": proj_id, "itemId": item_id, "fieldId": status_field_id, "optionId": status_default_id})
+            print("✔ Status set to first option")
+          if priority_default_id:
+            gql(mut_single, {"projectId": proj_id, "itemId": item_id, "fieldId": priority_field_id, "optionId": priority_default_id})
+            print("✔ Priority set to first option")
+
+          # 9) Compute Stage Folder link now (read Stage name)
+          q_fieldvals = """
+          query($itemId:ID!){
+            node(id:$itemId){
+              ... on ProjectV2Item{
+                fieldValues(first:50){
+                  nodes{
+                    ... on ProjectV2ItemFieldSingleSelectValue{
+                      field { ... on ProjectV2SingleSelectField { name } }
+                      name
+                    }
+                  }
+                }
+              }
+            }
+          }"""
+          vals = gql(q_fieldvals, {"itemId": item_id})["node"]["fieldValues"]["nodes"]
+          stage_name = None
+          for v in vals:
+            fld = v.get("field") or {}
+            if fld.get("name") == "Stage":
+              stage_name = v.get("name"); break
+
+          base = repo_url.rstrip("/") + f"/tree/{default_branch}"
+          paths = {
+            "Conceptualization": "/docs/conceptualization",
+            "Lit Review":        "/docs/lit_review",
+            "Data":              "/data",
+            "Analysis":          "/code",
+            "Visualization":     "/figures",
+            "Writing":           "/drafts",
+            "Submission":        "/docs/submission",
+            "Under Review":      "/docs/under_review",
+            "Revision-1":        "/docs/revision_1",
+            "Revision-2":        "/docs/revision_2",
+            "Publication":       "/docs/publication",
+          }
+          link = base + paths.get(stage_name or "", "")
+          if link and paths.get(stage_name or ""):
+            mut_text = """
+            mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $text:String!){
+              updateProjectV2ItemFieldValue(input:{
+                projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:{ text:$text }
+              }){ projectV2Item{ id } }
+            }"""
+            gql(mut_text, {"projectId": proj_id, "itemId": item_id, "fieldId": stage_folder_field_id, "text": link})
+            print(f"✔ Stage Folder set to {link}")
+          else:
+            print(f"ℹ️ Stage '{stage_name}' has no mapped folder; Stage Folder left blank")
+
+          print("✅ Done.")
+          PY
