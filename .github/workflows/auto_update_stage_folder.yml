@@ -54,45 +54,64 @@ jobs:
                   sys.exit(1)
               return data["data"]
 
-          # ---- 1) Fetch the project (user first, then org fallback) ----
-          base_query = '''
-          query($owner:String!, $number:Int!){
-            user(login:$owner){
-              projectV2(number:$number){
-                id
-                fields(first:50){
-                  nodes{
-                    ... on ProjectV2SingleSelectField { id name options { id name } }
-                    ... on ProjectV2FieldCommon       { id name }
-                  }
-                }
-                items(first:200){
-                  nodes{
+          # ---------- helpers ----------
+          def get_project(mode="user"):
+              base = '''
+              query($owner:String!, $number:Int!){
+                REPLACEME(login:$owner){
+                  projectV2(number:$number){
                     id
-                    fieldValues(first:25){
+                    fields(first:50){
                       nodes{
-                        ... on ProjectV2ItemFieldSingleSelectValue{
-                          field { ... on ProjectV2SingleSelectField { id name } }
-                          name
-                        }
-                        ... on ProjectV2ItemFieldTextValue{
-                          field { ... on ProjectV2FieldCommon { id name } }
-                          text
-                        }
+                        ... on ProjectV2SingleSelectField { id name options { id name } }
+                        ... on ProjectV2FieldCommon       { id name }
                       }
                     }
                   }
                 }
-              }
-            }
-          }'''
-          data = gql(base_query, {"owner": owner, "number": number})
-          project = data.get("user", {}).get("projectV2") if data.get("user") else None
+              }'''
+              q = base.replace("REPLACEME", mode)
+              data = gql(q, {"owner": owner, "number": number})
+              key = "user" if mode == "user" else "organization"
+              return data.get(key, {}).get("projectV2")
 
+          def get_items_page(mode="user", after=None):
+              base = '''
+              query($owner:String!, $number:Int!, $after:String){
+                REPLACEME(login:$owner){
+                  projectV2(number:$number){
+                    items(first:100, after:$after){
+                      nodes{
+                        id
+                        fieldValues(first:25){
+                          nodes{
+                            ... on ProjectV2ItemFieldSingleSelectValue{
+                              field { ... on ProjectV2SingleSelectField { id name } }
+                              name
+                            }
+                            ... on ProjectV2ItemFieldTextValue{
+                              field { ... on ProjectV2FieldCommon { id name } }
+                              text
+                            }
+                          }
+                        }
+                      }
+                      pageInfo{ hasNextPage endCursor }
+                    }
+                  }
+                }
+              }'''
+              q = base.replace("REPLACEME", mode)
+              data = gql(q, {"owner": owner, "number": number, "after": after})
+              key = "user" if mode == "user" else "organization"
+              return data[key]["projectV2"]["items"]
+
+          # ---------- 1) get project & field IDs ----------
+          project = get_project("user")
+          mode = "user"
           if not project:
-              org_query = base_query.replace("user(login:$owner)", "organization(login:$owner)")
-              data = gql(org_query, {"owner": owner, "number": number})
-              project = data.get("organization", {}).get("projectV2")
+              project = get_project("organization")
+              mode = "organization"
 
           if not project:
               print("❌ Project not found. Check PROJECT_OWNER/PROJECT_NUMBER.", file=sys.stderr)
@@ -101,7 +120,6 @@ jobs:
           project_id = project["id"]
           fields = project["fields"]["nodes"]
 
-          # ---- 2) Find field IDs for Stage (single select) and Stage Folder (text) ----
           stage_field_id = None
           stage_folder_field_id = None
           for f in fields:
@@ -114,23 +132,34 @@ jobs:
               print("❌ Missing fields. Ensure 'Stage' (single select) and 'Stage Folder' (text) exist.", file=sys.stderr)
               sys.exit(1)
 
-          # ---- 3) Map Stage → folder URL (edit base if your repo path changes) ----
-          base = "https://github.com/mzaerpour/Research-Paper-Workflow/tree/main"
+          # ---------- 2) fetch ALL items with pagination ----------
+          all_items = []
+          after = None
+          while True:
+              page = get_items_page(mode=mode, after=after)
+              all_items.extend(page["nodes"])
+              if page["pageInfo"]["hasNextPage"]:
+                  after = page["pageInfo"]["endCursor"]
+              else:
+                  break
+
+          # ---------- 3) map Stage → folder URL ----------
+          base_url = "https://github.com/mzaerpour/Research-Paper-Workflow/tree/main"
           mapping = {
-              "Conceptualization": f"{base}/docs/conceptualization",
-              "Lit Review":        f"{base}/docs/lit_review",
-              "Data":              f"{base}/data",
-              "Analysis":          f"{base}/code",
-              "Visualization":     f"{base}/figures",
-              "Writing":           f"{base}/drafts",
-              "Submission":        f"{base}/docs/submission",
-              "Under Review":      f"{base}/docs/under_review",
-              "Revision-1":        f"{base}/docs/revision_1",
-              "Revision-2":        f"{base}/docs/revision_2",
-              "Publication":       f"{base}/docs/publication",
+              "Conceptualization": f"{base_url}/docs/conceptualization",
+              "Lit Review":        f"{base_url}/docs/lit_review",
+              "Data":              f"{base_url}/data",
+              "Analysis":          f"{base_url}/code",
+              "Visualization":     f"{base_url}/figures",
+              "Writing":           f"{base_url}/drafts",
+              "Submission":        f"{base_url}/docs/submission",
+              "Under Review":      f"{base_url}/docs/under_review",
+              "Revision-1":        f"{base_url}/docs/revision_1",
+              "Revision-2":        f"{base_url}/docs/revision_2",
+              "Publication":       f"{base_url}/docs/publication",
           }
 
-          # ---- 4) Update mutation (for a text field) ----
+          # ---------- 4) update text field ----------
           update_mut = '''
           mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $text:String!){
             updateProjectV2ItemFieldValue(input:{
@@ -142,7 +171,7 @@ jobs:
           }'''
 
           updated = 0
-          for item in project["items"]["nodes"]:
+          for item in all_items:
               stage_val = None
               current_text = None
               for fv in item.get("fieldValues", {}).get("nodes", []):
