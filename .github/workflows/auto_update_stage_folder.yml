@@ -3,7 +3,7 @@ name: Auto-update Stage Folder link
 on:
   workflow_dispatch:        # run manually from Actions tab
   schedule:
-    - cron: "*/30 * * * *"  # optional: every 30 minutes
+    - cron: "* * * * *"  # optional: every 30 minutes
 
 jobs:
   sync:
