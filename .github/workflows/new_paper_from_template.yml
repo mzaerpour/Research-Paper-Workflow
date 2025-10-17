@@ -1,4 +1,4 @@
-name: New Paper – Create repo, add collaborators, link to Project
+name: New Paper – Create repo, scaffold, add collaborators, link to Project
 
 on:
   workflow_dispatch:
@@ -22,22 +22,22 @@ on:
         required: false
         type: string
       template_owner:
-        description: "Template repo owner"
-        required: true
+        description: "Template repo owner (must exist & be marked as Template)"
+        required: false
         type: string
         default: "mzaerpour"
       template_repo:
-        description: "Template repo name"
-        required: true
+        description: "Template repo name (leave blank to skip template)"
+        required: false
         type: string
         default: "paper-project-template"
       project_owner:
-        description: "Owner of the GitHub Project (your username or org)"
+        description: "Owner of your GitHub Project (username or org)"
         required: true
         type: string
         default: "mzaerpour"
       project_number:
-        description: "Your Project number (from the project URL)"
+        description: "Project number from the URL (e.g., 3)"
         required: true
         type: string
         default: "3"
@@ -62,7 +62,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Create repo, add collaborators, link Project row
+      - name: Create repo (template or scaffold), add collaborators, link Project row
         env:
           GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
           ITEM_TITLE: ${{ github.event.inputs.item_title }}
@@ -75,14 +75,14 @@ jobs:
           COLLABS: ${{ github.event.inputs.collaborators }}
         run: |
           python - <<'PY'
-          import os, sys, json, time, requests
+          import os, sys, base64, json, requests, time
 
           token   = os.environ["GH_TOKEN"]
           item_title = os.environ["ITEM_TITLE"].strip()
           new_repo_name = os.environ["NEW_REPO_NAME"].strip()
           repo_visibility = os.environ["REPO_VISIBILITY"].strip().lower()
-          template_owner = os.environ["TEMPLATE_OWNER"].strip()
-          template_repo  = os.environ["TEMPLATE_REPO"].strip()
+          template_owner = (os.environ.get("TEMPLATE_OWNER") or "").strip()
+          template_repo  = (os.environ.get("TEMPLATE_REPO") or "").strip()
           project_owner  = os.environ["PROJECT_OWNER"].strip()
           project_number = int(os.environ["PROJECT_NUMBER"])
           collabs = [u.strip() for u in (os.environ.get("COLLABS","").split(",") if os.environ.get("COLLABS") else []) if u.strip()]
@@ -98,8 +98,7 @@ jobs:
           def rest(method, url, **kw):
             r = requests.request(method, url, headers=H, **kw)
             if r.status_code >= 400:
-              print(f"REST {method} {url} -> {r.status_code} {r.text}")
-              r.raise_for_status()
+              raise requests.HTTPError(f"{method} {url} -> {r.status_code} {r.text}", response=r)
             return r.json() if r.text else {}
 
           def gql(q, v):
@@ -109,17 +108,76 @@ jobs:
               raise RuntimeError(j["errors"])
             return j["data"]
 
-          # 1) Create new repo from template (REST)
-          payload = {
-            "owner": project_owner,         # create under same owner as project
-            "name": new_repo_name,
-            "private": (repo_visibility == "private"),
-            "include_all_branches": False,
-          }
-          print(f"→ Creating repo {project_owner}/{new_repo_name} from {template_owner}/{template_repo} (visibility={repo_visibility})")
-          rest("POST", f"{REST}/repos/{template_owner}/{template_repo}/generate", json=payload)
+          # ---- 1) Try template generate; else create empty repo ----
+          created_from_template = False
+          try:
+            if template_owner and template_repo:
+              print(f"→ Attempting template generate: {template_owner}/{template_repo}")
+              payload = {
+                "owner": project_owner,                # new repo owner (same as project owner)
+                "name": new_repo_name,
+                "private": (repo_visibility == "private"),
+                "include_all_branches": False,
+              }
+              rest("POST", f"{REST}/repos/{template_owner}/{template_repo}/generate", json=payload)
+              created_from_template = True
+              print("✔ Created from template")
+            else:
+              print("ℹ️ No template specified; will scaffold from scratch")
+          except Exception as e:
+            print(f"⚠️ Template generate failed: {e}\n→ Will scaffold from scratch")
 
-          # 2) Get new repo id + URL (GraphQL)
+          if not created_from_template:
+            # Create new empty repo under the project owner
+            repo_payload = {
+              "name": new_repo_name,
+              "private": (repo_visibility == "private"),
+              "auto_init": True,
+              "description": "Research paper repo scaffolded by workflow.",
+            }
+            # create under user/org
+            url = f"{REST}/user/repos" if project_owner == rest("GET", f"{REST}/user")["login"] else f"{REST}/orgs/{project_owner}/repos"
+            rest("POST", url, json=repo_payload)
+            print("✔ Empty repo created")
+
+            # Scaffold standard folders/files via Contents API
+            def putfile(path, content):
+              b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+              rest("PUT", f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}",
+                   json={"message": f"Add {path}", "content": b64, "branch":"main"})
+
+            # Minimal README
+            putfile("README.md", f"# {new_repo_name}\n\nThis repo follows the Research Paper Workflow structure.\n")
+
+            # Standard tree (each with README.md)
+            scaffold = {
+              "data/README.md": "Data access notes. Do not commit raw sensitive data.\n",
+              "code/README.md": "Analysis code entry points, environment, and scripts.\n",
+              "figures/README.md": "Auto-generated figures saved here by scripts.\n",
+              "drafts/README.md": "Manuscript drafts, outlines, and text.\n",
+              "docs/conceptualization/README.md": "Concept notes and hypotheses.\n",
+              "docs/lit_review/README.md": "Literature review notes and sources.\n",
+              "docs/submission/README.md": "Submission files: cover letter, checklist.\n",
+              "docs/under_review/README.md": "Correspondence and tracking while under review.\n",
+              "docs/revision_1/README.md": "Round 1 revisions: response letter and changes.\n",
+              "docs/revision_2/README.md": "Round 2 revisions: response letter and changes.\n",
+              "docs/publication/README.md": "Accepted version, proofs, and post-publication materials.\n",
+              "NEW_PAPER_CHECKLIST.md": (
+                "# New Paper Checklist\n\n"
+                "- [ ] Update README with full paper title\n"
+                "- [ ] Add collaborators (Settings → Collaborators)\n"
+                "- [ ] Fill PROJECT_OVERVIEW.md\n"
+                "- [ ] Create initial issues: Lit Review, Data Prep, Analysis, Writing\n"
+                "- [ ] Set milestones: Draft, Submission, R&R 1, Acceptance, Publication\n"
+                "- [ ] Link repo issues to the central Project\n"
+                "- [ ] Verify folders (data/code/figures/drafts/docs/*)\n"
+              ),
+            }
+            for path, content in scaffold.items():
+              putfile(path, content)
+            print("✔ Scaffolded standard folders and files")
+
+          # ---- 2) Resolve repo info ----
           q_repo = """
           query($owner:String!,$name:String!){
             repository(owner:$owner, name:$name){ id url nameWithOwner }
@@ -130,13 +188,14 @@ jobs:
           owner_repo = repo_data["nameWithOwner"]
           print(f"✔ Repo ready: {owner_repo} ({repo_url})")
 
-          # 3) Add collaborators (REST)
+          # ---- 3) Add collaborators ----
           for u in collabs:
             print(f"→ Adding collaborator: {u}")
             # permission can be: pull, triage, push, maintain, admin
-            rest("PUT", f"{REST}/repos/{project_owner}/{new_repo_name}/collaborators/{u}", json={"permission":"push"})
+            rest("PUT", f"{REST}/repos/{project_owner}/{new_repo_name}/collaborators/{u}",
+                 json={"permission":"push"})
 
-          # 4) Find the Project, fields, and the item by title
+          # ---- 4) Link Project row Repository field ----
           q_proj = """
           query($owner:String!, $number:Int!){
             user(login:$owner){
@@ -146,7 +205,6 @@ jobs:
                   nodes{
                     ... on ProjectV2RepositoryField { id name }
                     ... on ProjectV2FieldCommon     { id name }
-                    ... on ProjectV2SingleSelectField { id name }
                   }
                 }
                 items(first:100){
@@ -172,10 +230,10 @@ jobs:
           for f in fields:
             if f["name"] == "Repository":
               repo_field_id = f["id"]
+              break
           if not repo_field_id:
             raise RuntimeError("Project is missing a 'Repository' field (type: Repository). Create it first.")
 
-          # Find the item whose title matches item_title
           item_id = None
           for it in proj["items"]["nodes"]:
             c = it.get("content") or {}
@@ -185,7 +243,6 @@ jobs:
           if not item_id:
             raise RuntimeError(f"Could not find a project item with title: {item_title!r}")
 
-          # 5) Update the item’s Repository field to point to the new repo
           mut = """
           mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $repoId:ID!){
             updateProjectV2ItemFieldValue(input:{
@@ -199,6 +256,5 @@ jobs:
           }"""
           gql(mut, {"projectId": proj_id, "itemId": item_id, "fieldId": repo_field_id, "repoId": repo_id})
           print(f"✔ Linked project row '{item_title}' to repository {owner_repo}")
-
-          print("✅ Done: repo created, collaborators added, Project linked.")
+          print("✅ Done.")
           PY
