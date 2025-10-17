@@ -21,9 +21,8 @@ on:
         description: "Comma-separated GitHub usernames to add (optional)"
         required: false
         type: string
-      # You created this in Step 1:
       template_owner:
-        description: "Template repo owner"
+        description: "Template repo owner (must be marked as Template)"
         required: true
         type: string
         default: "mzaerpour"
@@ -32,7 +31,6 @@ on:
         required: true
         type: string
         default: "research-project-template"
-      # Your Project (the dashboard) owner & number:
       project_owner:
         description: "Owner of your GitHub Project (username or org)"
         required: true
@@ -110,10 +108,10 @@ jobs:
               raise RuntimeError(j["errors"])
             return j["data"]
 
-          # who am I (so we know where we can create repos)
+          # who am I
           me = rest("GET", f"{REST}/user")["login"]
 
-          # 1) Create/reuse repo from template
+          # 1) Create/reuse repo from template, else plain create
           created = False
           exists = False
           try:
@@ -132,7 +130,6 @@ jobs:
               exists = True
               print("ℹ️ Repo already exists; will reuse")
             else:
-              # try plain create
               print(f"⚠️ Template generate failed: {e} → try plain create")
               try:
                 payload = {
@@ -154,7 +151,7 @@ jobs:
                 else:
                   raise
 
-          # 2) Resolve repo info
+          # 2) Repo info
           q_repo = """
           query($owner:String!,$name:String!){
             repository(owner:$owner, name:$name){
@@ -168,7 +165,7 @@ jobs:
           default_branch = (repo_data["defaultBranchRef"]["name"] if repo_data["defaultBranchRef"] else "main") or "main"
           print(f"✔ Repo ready: {owner_repo} ({repo_url}) default_branch={default_branch}")
 
-          # 3) Scaffold standard folders/files if missing
+          # 3) Scaffold folders/files if missing
           def file_exists(path):
             r = requests.get(f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}?ref={default_branch}", headers=H)
             return r.status_code == 200
@@ -207,7 +204,7 @@ jobs:
             except Exception as e:
               print(f"⚠️ Could not add collaborator {u}: {e}")
 
-          # 5) Load Project + fields (generic fragments only)
+          # 5) Load Project + fields
           q_proj = """
           query($owner:String!, $number:Int!){
             user(login:$owner){
@@ -235,12 +232,10 @@ jobs:
           d = gql(q_proj, {"owner": project_owner, "number": project_number})
           proj = d["user"]["projectV2"]
           if not proj:
-            raise RuntimeError(f"Could not resolve a ProjectV2 with number {project_number}. Check the project URL.")
-
+            raise RuntimeError(f"Could not resolve a ProjectV2 with number {project_number}. Check the URL.")
           proj_id = proj["id"]
           fields = proj["fields"]["nodes"]
 
-          # find field IDs by name
           repo_field_id = stage_field_id = status_field_id = priority_field_id = stage_folder_field_id = None
           stage_options = status_options = priority_options = []
           for f in fields:
@@ -250,15 +245,17 @@ jobs:
             elif f["name"] == "Priority": priority_field_id, priority_options = f["id"], (f.get("options") or [])
             elif f["name"] == "Stage Folder": stage_folder_field_id = f["id"]
 
-          if not repo_field_id: raise RuntimeError("Project missing 'Repository' field.")
-          if not stage_field_id or not stage_folder_field_id: raise RuntimeError("Project must have 'Stage' and 'Stage Folder'.")
+          if not repo_field_id:
+            raise RuntimeError("Project is missing a Repository-type field named 'Repository'.")
+          if not stage_field_id or not stage_folder_field_id:
+            raise RuntimeError("Project must have 'Stage' (single select) and 'Stage Folder' (text).")
 
           def first_id(opts): return (opts[0]["id"] if opts else None)
           stage_default_id   = first_id(stage_options)
           status_default_id  = first_id(status_options)
           priority_default_id= first_id(priority_options)
 
-          # 6) Find or create the row by title
+          # 6) Find or create row by title
           item_id = None
           for it in proj["items"]["nodes"]:
             c = it.get("content") or {}
@@ -274,17 +271,31 @@ jobs:
             item_id = gql(mut_create, {"projectId": proj_id, "title": item_title})["addProjectV2DraftIssue"]["projectItem"]["id"]
             print(f"✔ Created project row: {item_title}")
 
-          # 7) Set Repository field to this repo
-          mut_repo = """
+          # 7) Set Repository field (try both schema variants)
+          mut_repo_id = """
           mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $repoId:ID!){
             updateProjectV2ItemFieldValue(input:{
               projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:{ repositoryId:$repoId }
             }){ projectV2Item{ id } }
           }"""
-          gql(mut_repo, {"projectId": proj_id, "itemId": item_id, "fieldId": repo_field_id, "repoId": repo_id})
-          print("✔ Linked Repository field")
+          mut_repo_plain = """
+          mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $repoId:ID!){
+            updateProjectV2ItemFieldValue(input:{
+              projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:{ repository:$repoId }
+            }){ projectV2Item{ id } }
+          }"""
+          try:
+            gql(mut_repo_id, {"projectId": proj_id, "itemId": item_id, "fieldId": repo_field_id, "repoId": repo_id})
+            print("✔ Linked Repository via repositoryId")
+          except Exception as e:
+            msg = str(e)
+            if "argumentNotAccepted" in msg or "doesn't accept argument `repositoryId`" in msg:
+              gql(mut_repo_plain, {"projectId": proj_id, "itemId": item_id, "fieldId": repo_field_id, "repoId": repo_id})
+              print("✔ Linked Repository via repository")
+            else:
+              raise
 
-          # 8) Defaults for Stage/Status/Priority (first options)
+          # 8) Defaults (Stage/Status/Priority) → first options
           mut_single = """
           mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!){
             updateProjectV2ItemFieldValue(input:{
@@ -301,7 +312,7 @@ jobs:
             gql(mut_single, {"projectId": proj_id, "itemId": item_id, "fieldId": priority_field_id, "optionId": priority_default_id})
             print("✔ Priority set to first option")
 
-          # 9) Compute Stage Folder now (no waiting)
+          # 9) Compute Stage Folder link now
           q_fieldvals = """
           query($itemId:ID!){
             node(id:$itemId){
