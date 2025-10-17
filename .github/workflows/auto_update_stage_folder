@@ -1,18 +1,15 @@
 name: Auto-update Stage Folder link
 
 on:
-  workflow_dispatch:        # run manually from Actions tab
-  schedule:
-    - cron: "*/30 * * * *"  # optional: every 30 minutes
+  workflow_dispatch:  # run manually from Actions tab
 
 jobs:
   sync:
     runs-on: ubuntu-latest
 
-    # 👇 EDIT THESE TWO to match your project URL
     env:
-      PROJECT_OWNER: "mzaerpour"   # your GitHub username or org
-      PROJECT_NUMBER: "3"          # from https://github.com/users/mzaerpour/projects/3
+      PROJECT_OWNER: "mzaerpour"  # your username or org
+      PROJECT_NUMBER: "3"         # from https://github.com/users/mzaerpour/projects/3
 
     steps:
       - name: Set up Python
@@ -54,7 +51,7 @@ jobs:
                   sys.exit(1)
               return data["data"]
 
-          # ---- 1) Fetch the project (user first, then org as fallback) ----
+          # Fetch project (user first, then org)
           base_query = '''
           query($owner:String!, $number:Int!){
             user(login:$owner){
@@ -101,7 +98,7 @@ jobs:
           project_id = project["id"]
           fields = project["fields"]["nodes"]
 
-          # ---- 2) Get field IDs for Stage (single select) and Stage Folder (text) ----
+          # Find field IDs
           stage_field_id = None
           stage_folder_field_id = None
           for f in fields:
@@ -114,7 +111,6 @@ jobs:
               print("❌ Missing fields. Ensure 'Stage' (single select) and 'Stage Folder' (text) exist.", file=sys.stderr)
               sys.exit(1)
 
-          # ---- 3) Map Stage → folder URL (edit base if your repo path changes) ----
           base = "https://github.com/mzaerpour/Research-Paper-Workflow/tree/main"
           mapping = {
               "Conceptualization": f"{base}/docs/conceptualization",
@@ -130,7 +126,6 @@ jobs:
               "Publication":       f"{base}/docs/publication",
           }
 
-          # ---- 4) Update mutation for a text field ----
           update_mut = '''
           mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $text:String!){
             updateProjectV2ItemFieldValue(input:{
@@ -150,3 +145,24 @@ jobs:
                   if not fld:
                       continue
                   if fld.get("name") == "Stage" and "name" in fv:
+                      stage_val = fv["name"]
+                  if fld.get("name") == "Stage Folder" and "text" in fv:
+                      current_text = fv["text"]
+
+              if not stage_val:
+                  continue
+
+              target = mapping.get(stage_val)
+              if not target or target == current_text:
+                  continue
+
+              gql(update_mut, {
+                  "projectId": project_id,
+                  "itemId": item["id"],
+                  "fieldId": stage_folder_field_id,
+                  "text": target
+              })
+              updated += 1
+
+          print(f"✅ Updated {updated} item(s).")
+          PY
