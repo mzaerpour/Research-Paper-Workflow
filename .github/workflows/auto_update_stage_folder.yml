@@ -3,7 +3,7 @@ name: Auto-update Stage Folder link
 on:
   workflow_dispatch: {}          # run manually from Actions tab
   schedule:
-    - cron: "*/5 * * * *"        # GitHub Actions minimum schedule = 5 minutes
+    - cron: "* * * * *"        # GitHub Actions minimum schedule = 5 minutes
 
 jobs:
   sync:
