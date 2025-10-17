@@ -11,7 +11,7 @@ jobs:
     env:
       # 👇 EDIT THESE TWO TO MATCH YOUR PROJECT
       PROJECT_OWNER: "mzaerpour"   # GitHub username OR org login
-      PROJECT_NUMBER: "1"          # the number in your project URL (see step 2 below)
+      PROJECT_NUMBER: "3"          # the number in your project URL (see step 2 below)
     steps:
       - name: Set up Python
       - uses: actions/setup-python@v5
