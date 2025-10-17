@@ -75,7 +75,7 @@ jobs:
           COLLABS: ${{ github.event.inputs.collaborators }}
         run: |
           python - <<'PY'
-          import os, sys, base64, json, requests
+          import os, sys, base64, requests
 
           token   = os.environ["GH_TOKEN"]
           item_title = os.environ["ITEM_TITLE"].strip()
@@ -108,13 +108,12 @@ jobs:
               raise RuntimeError(j["errors"])
             return j["data"]
 
-          # ---------- 0) who am I (to know if creating under user or org) ----------
+          # ---------- 0) who am I ----------
           me = rest("GET", f"{REST}/user")["login"]
 
           # ---------- 1) Create (or reuse) repo ----------
           created = False
           exists = False
-          # try template
           if template_owner and template_repo:
             try:
               print(f"→ Attempting template generate: {template_owner}/{template_repo}")
@@ -128,16 +127,13 @@ jobs:
               created = True
               print("✔ Created from template")
             except Exception as e:
-              # if "name already exists", mark exists and continue
-              msg = str(e)
-              if "name already exists" in msg:
+              if "name already exists" in str(e):
                 exists = True
                 print("ℹ️ Repo already exists; will reuse")
               else:
                 print(f"⚠️ Template generate failed: {e} → will try plain create")
 
           if not created and not exists:
-            # plain create (idempotent)
             try:
               payload = {
                 "name": new_repo_name,
@@ -170,7 +166,7 @@ jobs:
           default_branch = (repo_data["defaultBranchRef"]["name"] if repo_data["defaultBranchRef"] else "main") or "main"
           print(f"✔ Repo ready: {owner_repo} ({repo_url}) default_branch={default_branch}")
 
-          # ---------- 3) Scaffold tree if folders missing ----------
+          # ---------- 3) Scaffold tree if missing ----------
           def file_exists(path):
             r = requests.get(f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}?ref={default_branch}", headers=H)
             return r.status_code == 200
@@ -178,11 +174,11 @@ jobs:
           def putfile(path, content):
             if file_exists(path):
               return
+            import base64
             b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
             rest("PUT", f"{REST}/repos/{project_owner}/{new_repo_name}/contents/{path}",
                  json={"message": f"Add {path}", "content": b64, "branch": default_branch})
 
-          # always ensure minimal README + standard folders
           putfile("README.md", f"# {new_repo_name}\n\nThis repo follows the Research Paper Workflow structure.\n")
           scaffold = {
             "data/README.md": "Data access notes. Do not commit raw sensitive data.\n",
@@ -210,7 +206,7 @@ jobs:
             putfile(path, content)
           print("✔ Scaffold verified")
 
-          # ---------- 4) Add collaborators (push permission) ----------
+          # ---------- 4) Add collaborators ----------
           for u in collabs:
             print(f"→ Adding collaborator: {u}")
             try:
@@ -219,7 +215,7 @@ jobs:
             except Exception as e:
               print(f"⚠️ Could not add collaborator {u}: {e}")
 
-          # ---------- 5) Load Project + fields ----------
+          # ---------- 5) Load Project + fields (NO repo-specific type) ----------
           q_proj = """
           query($owner:String!, $number:Int!){
             user(login:$owner){
@@ -227,15 +223,19 @@ jobs:
                 id
                 fields(first:50){
                   nodes{
-                    ... on ProjectV2RepositoryField     { id name }
-                    ... on ProjectV2FieldCommon         { id name }
-                    ... on ProjectV2SingleSelectField   { id name options{ id name } }
+                    ... on ProjectV2FieldCommon       { id name }
+                    ... on ProjectV2SingleSelectField { id name options{ id name } }
                   }
                 }
                 items(first:100){
                   nodes{
                     id
-                    content{ __typename ... on DraftIssue { title } ... on Issue{ title } ... on PullRequest{ title } }
+                    content{
+                      __typename
+                      ... on DraftIssue { title }
+                      ... on Issue      { title }
+                      ... on PullRequest{ title }
+                    }
                   }
                 }
               }
@@ -246,20 +246,18 @@ jobs:
           proj_id = proj["id"]
           fields = proj["fields"]["nodes"]
 
-          # field IDs
+          # field IDs (by name)
           repo_field_id = stage_field_id = status_field_id = priority_field_id = stage_folder_field_id = None
+          stage_options = status_options = priority_options = []
           for f in fields:
             if f["name"] == "Repository":
               repo_field_id = f["id"]
             elif f["name"] == "Stage":
-              stage_field_id = f["id"]
-              stage_options = f.get("options") or []
+              stage_field_id = f["id"]; stage_options = f.get("options") or []
             elif f["name"] == "Status":
-              status_field_id = f["id"]
-              status_options = f.get("options") or []
+              status_field_id = f["id"]; status_options = f.get("options") or []
             elif f["name"] == "Priority":
-              priority_field_id = f["id"]
-              priority_options = f.get("options") or []
+              priority_field_id = f["id"]; priority_options = f.get("options") or []
             elif f["name"] == "Stage Folder":
               stage_folder_field_id = f["id"]
 
@@ -268,21 +266,18 @@ jobs:
           if not stage_field_id or not stage_folder_field_id:
             raise RuntimeError("Project must have 'Stage' (single select) and 'Stage Folder' (text) fields.")
 
-          # pick FIRST options as defaults where applicable
-          def first_option_id(opts): return (opts[0]["id"] if opts else None)
-          stage_default_id   = first_option_id(stage_options)     # e.g., Conceptualization
-          status_default_id  = first_option_id(status_options)    # first of your Status options
-          priority_default_id= first_option_id(priority_options)
+          def first_id(opts): return (opts[0]["id"] if opts else None)
+          stage_default_id   = first_id(stage_options)
+          status_default_id  = first_id(status_options)
+          priority_default_id= first_id(priority_options)
 
-          # ---------- 6) Find or create the item (row) ----------
+          # ---------- 6) Find or create the item ----------
           item_id = None
           for it in proj["items"]["nodes"]:
             c = it.get("content") or {}
             if c.get("title") == item_title:
               item_id = it["id"]; break
-
           if not item_id:
-            # create a Draft Issue directly in the project
             mut_create = """
             mutation($projectId:ID!, $title:String!){
               addProjectV2DraftIssue(input:{projectId:$projectId, title:$title}) {
@@ -302,7 +297,7 @@ jobs:
           gql(mut_repo, {"projectId": proj_id, "itemId": item_id, "fieldId": repo_field_id, "repoId": repo_id})
           print("✔ Linked Repository field")
 
-          # ---------- 8) Set defaults for Stage / Status / Priority ----------
+          # ---------- 8) Defaults (Stage/Status/Priority) ----------
           mut_single = """
           mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!){
             updateProjectV2ItemFieldValue(input:{
@@ -319,10 +314,9 @@ jobs:
             gql(mut_single, {"projectId": proj_id, "itemId": item_id, "fieldId": priority_field_id, "optionId": priority_default_id})
             print("✔ Priority set to first option")
 
-          # ---------- 9) Compute Stage Folder link now (no waiting) ----------
-          # We need the current Stage name to choose the folder path
+          # ---------- 9) Compute Stage Folder link now ----------
           q_fieldvals = """
-          query($projectId:ID!, $itemId:ID!){
+          query($itemId:ID!){
             node(id:$itemId){
               ... on ProjectV2Item{
                 fieldValues(first:50){
@@ -336,7 +330,7 @@ jobs:
               }
             }
           }"""
-          vals = gql(q_fieldvals, {"projectId": proj_id, "itemId": item_id})["node"]["fieldValues"]["nodes"]
+          vals = gql(q_fieldvals, {"itemId": item_id})["node"]["fieldValues"]["nodes"]
           stage_name = None
           for v in vals:
             fld = v.get("field") or {}
