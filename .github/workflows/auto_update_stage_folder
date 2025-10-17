@@ -1,16 +1,17 @@
 name: Auto-update Stage Folder link
 
 on:
-  workflow_dispatch:  # run manually from Actions tab
+  workflow_dispatch: {}          # run manually from Actions tab
+  schedule:
+    - cron: "*/5 * * * *"        # GitHub Actions minimum schedule = 5 minutes
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-
-    env:
-      PROJECT_OWNER: "mzaerpour"  # your username or org
-      PROJECT_NUMBER: "3"         # from https://github.com/users/mzaerpour/projects/3
-
+    permissions:
+      actions: read
+      contents: read
+      issues: read
     steps:
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,55 +26,83 @@ jobs:
       - name: Sync Stage → Stage Folder
         env:
           GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
-          PROJECT_OWNER: ${{ env.PROJECT_OWNER }}
-          PROJECT_NUMBER: ${{ env.PROJECT_NUMBER }}
+          PROJECT_OWNER: mzaerpour           # <— your project owner (user/org)
+          PROJECT_NUMBER: "3"                 # <— from the project URL .../projects/3
         run: |
           python - <<'PY'
-          import os, sys, requests
+          import os, requests
 
           token   = os.environ["GH_TOKEN"]
           owner   = os.environ["PROJECT_OWNER"]
           number  = int(os.environ["PROJECT_NUMBER"])
-
-          headers = {
-              "Authorization": f"Bearer {token}",
-              "Content-Type": "application/json",
-              "Accept": "application/vnd.github+json",
+          H = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
           }
-          endpoint = "https://api.github.com/graphql"
+          GQL = "https://api.github.com/graphql"
 
-          def gql(query, variables):
-              r = requests.post(endpoint, headers=headers, json={"query": query, "variables": variables})
-              r.raise_for_status()
-              data = r.json()
-              if "errors" in data:
-                  print("GraphQL errors:", data["errors"], file=sys.stderr)
-                  sys.exit(1)
-              return data["data"]
+          def gql(q, v):
+            r = requests.post(GQL, headers=H, json={"query": q, "variables": v})
+            j = r.json()
+            if "errors" in j:
+              raise RuntimeError(j["errors"])
+            return j["data"]
 
-          # Fetch project (user first, then org)
-          base_query = '''
+          # 1) Get project + field ids
+          q_fields = """
           query($owner:String!, $number:Int!){
             user(login:$owner){
               projectV2(number:$number){
                 id
                 fields(first:50){
                   nodes{
-                    ... on ProjectV2Field{ id name }
-                    ... on ProjectV2SingleSelectField{ id name options{ id name } }
+                    ... on ProjectV2FieldCommon       { id name }
+                    ... on ProjectV2SingleSelectField { id name }
                   }
                 }
-                items(first:200){
+              }
+            }
+          }"""
+          d = gql(q_fields, {"owner": owner, "number": number})
+          proj = d["user"]["projectV2"]
+          proj_id = proj["id"]
+          fields = {f["name"]: f["id"] for f in proj["fields"]["nodes"]}
+          stage_folder_field_id = fields.get("Stage Folder")
+          if not stage_folder_field_id:
+            raise RuntimeError("Project needs a Text field named 'Stage Folder'.")
+          stage_field_id = fields.get("Stage")
+          if not stage_field_id:
+            raise RuntimeError("Project needs a Single-select field named 'Stage'.")
+
+          # 2) Page through items, read Stage + repo (if Issue), update Stage Folder
+          q_items = """
+          query($owner:String!, $number:Int!, $after:String){
+            user(login:$owner){
+              projectV2(number:$number){
+                id
+                items(first:100, after:$after){
+                  pageInfo{ hasNextPage endCursor }
                   nodes{
                     id
-                    fieldValues(first:25){
+                    content{
+                      __typename
+                      ... on Issue {
+                        repository {
+                          url
+                          defaultBranchRef { name }
+                        }
+                      }
+                      ... on DraftIssue { title }
+                    }
+                    fieldValues(first:50){
                       nodes{
                         ... on ProjectV2ItemFieldSingleSelectValue{
-                          field{ ... on ProjectV2SingleSelectField { id name } }
+                          field { ... on ProjectV2SingleSelectField { name } }
                           name
                         }
                         ... on ProjectV2ItemFieldTextValue{
-                          field{ id name }
+                          field { ... on ProjectV2FieldCommon { name } }
                           text
                         }
                       }
@@ -82,87 +111,71 @@ jobs:
                 }
               }
             }
-          }'''
-          data = gql(base_query, {"owner": owner, "number": number})
-          project = data.get("user", {}).get("projectV2") if data.get("user") else None
+          }"""
 
-          if not project:
-              org_query = base_query.replace("user(login:$owner)", "organization(login:$owner)")
-              data = gql(org_query, {"owner": owner, "number": number})
-              project = data.get("organization", {}).get("projectV2")
-
-          if not project:
-              print("❌ Project not found. Check PROJECT_OWNER/PROJECT_NUMBER.", file=sys.stderr)
-              sys.exit(1)
-
-          project_id = project["id"]
-          fields = project["fields"]["nodes"]
-
-          # Find field IDs
-          stage_field_id = None
-          stage_folder_field_id = None
-          for f in fields:
-              if f["name"] == "Stage":
-                  stage_field_id = f["id"]
-              if f["name"] == "Stage Folder":
-                  stage_folder_field_id = f["id"]
-
-          if not stage_field_id or not stage_folder_field_id:
-              print("❌ Missing fields. Ensure 'Stage' (single select) and 'Stage Folder' (text) exist.", file=sys.stderr)
-              sys.exit(1)
-
-          base = "https://github.com/mzaerpour/Research-Paper-Workflow/tree/main"
-          mapping = {
-              "Conceptualization": f"{base}/docs/conceptualization",
-              "Lit Review":        f"{base}/docs/lit_review",
-              "Data":              f"{base}/data",
-              "Analysis":          f"{base}/code",
-              "Visualization":     f"{base}/figures",
-              "Writing":           f"{base}/drafts",
-              "Submission":        f"{base}/docs/submission",
-              "Under Review":      f"{base}/docs/under_review",
-              "Revision-1":        f"{base}/docs/revision_1",
-              "Revision-2":        f"{base}/docs/revision_2",
-              "Publication":       f"{base}/docs/publication",
-          }
-
-          update_mut = '''
+          mut_text = """
           mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $text:String!){
             updateProjectV2ItemFieldValue(input:{
-              projectId:$projectId,
-              itemId:$itemId,
-              fieldId:$fieldId,
-              value:{ text:$text }
-            }){ projectV2Item { id } }
-          }'''
+              projectId:$projectId, itemId:$itemId, fieldId:$fieldId, value:{ text:$text }
+            }){ projectV2Item{ id } }
+          }"""
 
-          updated = 0
-          for item in project["items"]["nodes"]:
-              stage_val = None
-              current_text = None
-              for fv in item.get("fieldValues", {}).get("nodes", []):
-                  fld = fv.get("field")
-                  if not fld:
-                      continue
-                  if fld.get("name") == "Stage" and "name" in fv:
-                      stage_val = fv["name"]
-                  if fld.get("name") == "Stage Folder" and "text" in fv:
-                      current_text = fv["text"]
+          # Map Stage → subfolder
+          PATHS = {
+            "Conceptualization": "/docs/conceptualization",
+            "Lit Review":        "/docs/lit_review",
+            "Data":              "/data",
+            "Analysis":          "/code",
+            "Visualization":     "/figures",
+            "Writing":           "/drafts",
+            "Submission":        "/docs/submission",
+            "Under Review":      "/docs/under_review",
+            "Revision-1":        "/docs/revision_1",
+            "Revision-2":        "/docs/revision_2",
+            "Publication":       "/docs/publication",
+          }
 
-              if not stage_val:
-                  continue
+          after = None
+          updates = 0
+          while True:
+            d = gql(q_items, {"owner": owner, "number": number, "after": after})
+            items = d["user"]["projectV2"]["items"]
+            for node in items["nodes"]:
+              item_id   = node["id"]
+              content   = node.get("content") or {}
+              fvalues   = node.get("fieldValues", {}).get("nodes", [])
 
-              target = mapping.get(stage_val)
-              if not target or target == current_text:
-                  continue
+              # read Stage name
+              stage_name = None
+              for v in fvalues:
+                fld = (v.get("field") or {})
+                if fld.get("name") == "Stage":
+                  stage_name = v.get("name")
+                  break
+              if not stage_name or stage_name not in PATHS:
+                continue
 
-              gql(update_mut, {
-                  "projectId": project_id,
-                  "itemId": item["id"],
-                  "fieldId": stage_folder_field_id,
-                  "text": target
-              })
-              updated += 1
+              # derive repo base from Issue content; if Draft, we can’t build a link
+              repo_url = None
+              branch   = None
+              if content.get("__typename") == "Issue":
+                repo = content.get("repository") or {}
+                repo_url = repo.get("url")
+                branch   = (repo.get("defaultBranchRef") or {}).get("name") or "main"
+              if not repo_url:
+                # No repo (Draft rows) → skip
+                continue
 
-          print(f"✅ Updated {updated} item(s).")
+              link = repo_url.rstrip("/") + f"/tree/{branch}" + PATHS[stage_name]
+
+              # write Stage Folder
+              gql(mut_text, {"projectId": proj_id, "itemId": item_id,
+                             "fieldId": stage_folder_field_id, "text": link})
+              updates += 1
+
+            if not items["pageInfo"]["hasNextPage"]:
+              break
+            after = items["pageInfo"]["endCursor"]
+
+          print(f"✔ Updated {updates} item(s).")
           PY
